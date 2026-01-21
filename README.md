@@ -2,16 +2,7 @@
 
 ## 개요
 
-OpenStack Skyline과 통합된 **프로덕션급 포트포워딩 관리 API**입니다.
-
-- **FastAPI** 기반 고성능 REST API
-- **SQLAlchemy** ORM으로 데이터 영구 저장
-- **Pydantic** 자동 검증 및 문서화
-- **자동 부하 분산** - Floating IP 최적 할당
-- **포트 충돌 감지** - 중복 할당 방지
-- **실시간 모니터링** - 용량 추적 및 상태 조회
-- **iptables 통합** - Proxy VM에 자동 규칙 적용
-- **OpenAPI 문서** - 자동 생성 API 문서 (Swagger UI)
+OpenStack에 있는 내부 네트워크를 외부로 포트포워딩 하기 위한 Api 시스템 입니다.
 
 ---
 
