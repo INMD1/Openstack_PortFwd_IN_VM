@@ -1,0 +1,57 @@
+# docker-compose.yml - 로컬 개발 환경 (SQLite 사용)
+
+version: '3.8'
+
+services:
+  # 포트포워딩 API (SQLite 사용)
+  api:
+    build: .
+    environment:
+      DATABASE_URL: sqlite:///./data/portfwd_rules.db
+      API_HOST: 0.0.0.0
+      API_PORT: 8080
+      PROXY_VM_IP: 10.0.0.10  # Proxy VM 내부 IP
+      PROXY_VM_SSH_PORT: 22
+      # ⚠️ 1:1 NAT 매핑된 Proxy VM 내부 IP 입력 (외부 Floating IP 아님)
+      SSH_FLOATING_IP: 10.0.0.11        # SSH 전용 (외부 IP에 1:1 NAT)
+      PORTFWD_FLOATING_IP_1: 10.0.0.12  # 포트포워딩용 1
+      PORTFWD_FLOATING_IP_2: 10.0.0.13  # 포트포워딩용 2
+      ENV: development
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+      - sqlite_data:/app/data
+    command: uvicorn portfwd_api:app --reload --host 0.0.0.0 --port 8080
+
+  # Redis (캐싱 - 선택사항)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # PostgreSQL (필요시 주석 해제)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_DB: skyline_portfwd
+  #     POSTGRES_USER: skyline
+  #     POSTGRES_PASSWORD: skyline_password
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  sqlite_data:
+  # postgres_data:
+
+networks:
+  default:
+    name: portfwd_network
