@@ -4,6 +4,11 @@
 # ============================================================================
 
 import os
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
+
 import subprocess
 import json
 import uuid
@@ -62,14 +67,44 @@ class FloatingIPConfig:
     """
     # 1번 IP: SSH 전용 - 랜덤 포트 할당 (1:1 NAT 내부 IP)
     SSH_FLOATING_IP = os.getenv('SSH_FLOATING_IP', '10.0.0.11')
+    SSH_FLOATING_IP_GET = os.getenv('SSH_FLOATING_IP_GET', SSH_FLOATING_IP)
     
     # 2번/3번 IP: 일반 포트포워딩용 - 두 IP 비교해서 여유있는 쪽 선택
+    PORTFWD_FLOATING_IP_1 = os.getenv('PORTFWD_FLOATING_IP_1', '10.0.0.12')
+    PORTFWD_FLOATING_IP_1_GET = os.getenv('PORTFWD_FLOATING_IP_1_GET', PORTFWD_FLOATING_IP_1)
+
+    PORTFWD_FLOATING_IP_2 = os.getenv('PORTFWD_FLOATING_IP_2', '10.0.0.13')
+    PORTFWD_FLOATING_IP_2_GET = os.getenv('PORTFWD_FLOATING_IP_2_GET', PORTFWD_FLOATING_IP_2)
+
     PORTFWD_FLOATING_IPS = [
-        os.getenv('PORTFWD_FLOATING_IP_1', '10.0.0.12'),
-        os.getenv('PORTFWD_FLOATING_IP_2', '10.0.0.13')
+        PORTFWD_FLOATING_IP_1,
+        PORTFWD_FLOATING_IP_2
     ]
     
-    # 전체 IP 목록
+    # Internal(System) -> External(Display) Mapping
+    IP_MAP = {
+        SSH_FLOATING_IP: SSH_FLOATING_IP_GET,
+        PORTFWD_FLOATING_IP_1: PORTFWD_FLOATING_IP_1_GET,
+        PORTFWD_FLOATING_IP_2: PORTFWD_FLOATING_IP_2_GET
+    }
+    
+    # External(Display) -> Internal(System) Mapping
+    REVERSE_IP_MAP = {v: k for k, v in IP_MAP.items()}
+
+    @classmethod
+    def get_external_ip(cls, internal_ip: str) -> str:
+        """내부 IP를 외부 표시용 IP로 변환"""
+        return cls.IP_MAP.get(internal_ip, internal_ip)
+
+    @classmethod
+    def get_internal_ip(cls, external_ip: str) -> str:
+        """외부 표시용 IP를 내부 시스템용 IP로 변환"""
+        # 이미 내부 IP인 경우 그대로 반환 (사용자가 내부 IP 사용 시도 시)
+        if external_ip in cls.IP_MAP:
+            return external_ip
+        return cls.REVERSE_IP_MAP.get(external_ip, external_ip)
+    
+    # 전체 IP 목록 (시스템용 Internal IP 기준)
     ALL_FLOATING_IPS = [SSH_FLOATING_IP] + PORTFWD_FLOATING_IPS
     
     # 포트 범위 설정
@@ -175,7 +210,7 @@ class PortForwardingCreate(BaseModel):
         default=ServiceTypeEnum.OTHER, 
         description="서비스 유형: ssh(1번 IP) 또는 other(2번/3번 IP 비교 선택)"
     )
-    proxy_external_ip: Optional[str] = Field(None, description="Floating IP (선택사항, 자동 선택)")
+    proxy_external_ip: Optional[str] = Field(None, description="Floating IP (선택사항, 자동 선택, External/Internal 모두 가능)")
     proxy_external_port: Optional[int] = Field(None, ge=1, le=65535, description="외부 포트 (선택, 자동 할당)")
     protocol: ProtocolEnum = Field(default=ProtocolEnum.TCP, description="TCP 또는 UDP")
     description: Optional[str] = Field(None, max_length=500, description="규칙 설명")
@@ -229,6 +264,11 @@ class PortForwardingResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @validator('proxy_external_ip', pre=True)
+    def map_to_external_ip(cls, v):
+        """Internal IP를 External IP로 변환하여 응답"""
+        return FloatingIPConfig.get_external_ip(v)
+
 class StatusResponse(BaseModel):
     """상태 응답"""
     total_rules: int
@@ -248,12 +288,22 @@ class FloatingIPStatus(BaseModel):
     usage_percent: float
     available_ports: int
     ports: List[int]
+    
+    @validator('ip', pre=True)
+    def map_to_external_ip(cls, v):
+        """Internal IP를 External IP로 변환하여 응답"""
+        return FloatingIPConfig.get_external_ip(v)
 
 class PortAllocationResponse(BaseModel):
     """포트 할당 결과"""
     floating_ip: str
     external_port: int
     role: str
+
+    @validator('floating_ip', pre=True)
+    def map_to_external_ip(cls, v):
+        """Internal IP를 External IP로 변환하여 응답"""
+        return FloatingIPConfig.get_external_ip(v)
 
 # ============================================================================
 # FastAPI 애플리케이션
@@ -600,8 +650,8 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.1.0",
         "config": {
-            "ssh_ip": FloatingIPConfig.SSH_FLOATING_IP,
-            "portfwd_ips": FloatingIPConfig.PORTFWD_FLOATING_IPS,
+            "ssh_ip": FloatingIPConfig.get_external_ip(FloatingIPConfig.SSH_FLOATING_IP),
+            "portfwd_ips": [FloatingIPConfig.get_external_ip(ip) for ip in FloatingIPConfig.PORTFWD_FLOATING_IPS],
             "env": os.getenv('ENV', 'development')
         }
     }
@@ -632,13 +682,16 @@ async def create_port_forwarding(
         
         # 사용자가 IP를 직접 지정한 경우
         if request.proxy_external_ip:
+            # External IP 입력 시 Internal IP로 변환
+            request_ip = FloatingIPConfig.get_internal_ip(request.proxy_external_ip)
+            
             # IP가 서비스 유형에 맞는지 검증 (경고만, 차단하지 않음)
-            if not validate_ip_for_service_type(request.proxy_external_ip, request.service_type.value):
+            if not validate_ip_for_service_type(request_ip, request.service_type.value):
                 logger.warning(
-                    f"서비스 유형 {request.service_type.value}에 권장되지 않는 IP: {request.proxy_external_ip}"
+                    f"서비스 유형 {request.service_type.value}에 권장되지 않는 IP: {request.proxy_external_ip} (Internal: {request_ip})"
                 )
             
-            assigned_ip = request.proxy_external_ip
+            assigned_ip = request_ip
             
             if request.proxy_external_port:
                 # 포트도 지정된 경우 충돌 검사
@@ -750,7 +803,9 @@ async def list_port_forwardings(
             query = query.filter(PortForwardingRule.status == status_filter)
         
         if floating_ip:
-            query = query.filter(PortForwardingRule.proxy_external_ip == floating_ip)
+            # Internal IP로 변환하여 검색
+            internal_ip = FloatingIPConfig.get_internal_ip(floating_ip)
+            query = query.filter(PortForwardingRule.proxy_external_ip == internal_ip)
         
         if service_type:
             query = query.filter(PortForwardingRule.service_type == service_type)
@@ -1026,6 +1081,9 @@ async def get_status(
             "ports": [r.proxy_external_port for r in ssh_active]
         }
         
+        # 키를 External IP로 변경
+        floating_ip_status[FloatingIPConfig.get_external_ip(ssh_ip)] = floating_ip_status.pop(ssh_ip)
+        
         # 포트포워딩 IP 상태
         for ip in FloatingIPConfig.PORTFWD_FLOATING_IPS:
             rules = db.query(PortForwardingRule).filter(
@@ -1042,6 +1100,8 @@ async def get_status(
                 "port_range": list(FloatingIPConfig.PORTFWD_PORT_RANGE),
                 "ports": [r.proxy_external_port for r in active_rules]
             }
+            # 키를 External IP로 변경
+            floating_ip_status[FloatingIPConfig.get_external_ip(ip)] = floating_ip_status.pop(ip)
         
         return StatusResponse(
             total_rules=total,
