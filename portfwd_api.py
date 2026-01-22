@@ -468,6 +468,45 @@ def validate_ip_for_service_type(floating_ip: str, service_type: str) -> bool:
 # 실행 모드: local(Proxy VM 내부) 또는 remote(SSH로 원격 전달)
 PROXY_MODE = os.getenv('PROXY_MODE', 'local')
 
+
+def check_iptables_rule_exists(
+    floating_ip: str,
+    external_port: int,
+    internal_ip: str,
+    internal_port: int,
+    protocol: str = "tcp"
+) -> bool:
+    """
+    iptables에 해당 규칙이 이미 존재하는지 확인
+    
+    Returns:
+        True: 규칙이 이미 존재함
+        False: 규칙이 존재하지 않음
+    """
+    if os.getenv('ENV') != 'production':
+        return False  # 개발 환경에서는 항상 새로 추가
+    
+    try:
+        # PREROUTING 체인에서 해당 규칙 확인
+        check_cmd = f"sudo iptables -t nat -C PREROUTING -p {protocol} -d {floating_ip} --dport {external_port} -j DNAT --to-destination {internal_ip}:{internal_port}"
+        
+        if PROXY_MODE == 'local':
+            result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        else:
+            ssh_base = f"ssh -o StrictHostKeyChecking=no -p {PROXY_VM_SSH_PORT}"
+            if PROXY_VM_SSH_KEY_PATH:
+                ssh_base += f" -i {PROXY_VM_SSH_KEY_PATH}"
+            ssh_base += f" {PROXY_VM_SSH_USER}@{PROXY_VM_IP}"
+            result = subprocess.run(f"{ssh_base} '{check_cmd}'", shell=True, capture_output=True, text=True, timeout=10)
+        
+        # returncode 0 = 규칙 존재, 1 = 규칙 없음
+        return result.returncode == 0
+        
+    except Exception as e:
+        logger.warning(f"iptables 규칙 확인 중 오류: {str(e)}")
+        return False
+
+
 def apply_iptables_rule(
     floating_ip: str,
     external_port: int,
@@ -483,10 +522,17 @@ def apply_iptables_rule(
     - local: Proxy VM 내부에서 직접 sudo iptables 실행
     - remote: SSH로 Proxy VM에 명령 전달
     - development: 시뮬레이션만 (로그 출력)
+    
+    추가 시 이미 존재하는 규칙은 스킵합니다.
     """
     try:
         action = "-A" if add else "-D"
         action_text = "추가" if add else "삭제"
+        
+        # 추가 시 중복 체크
+        if add and check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol):
+            logger.info(f"iptables 규칙 이미 존재 (스킵): {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
+            return True, "이미 존재하는 규칙 (스킵)"
         
         # 1. DNAT 규칙 (외부 → 내부 변환)
         nat_rule = (
@@ -559,7 +605,8 @@ def save_iptables_persistent() -> bool:
         return True
     
     try:
-        save_cmd = "iptables-save > /etc/iptables/rules.v4"
+        # sudo sh -c 형태로 리다이렉션도 root 권한으로 실행
+        save_cmd = "sh -c 'iptables-save > /etc/iptables/rules.v4'"
         
         if PROXY_MODE == 'local':
             # 로컬 모드: 직접 실행

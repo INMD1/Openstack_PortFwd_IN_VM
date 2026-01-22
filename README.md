@@ -68,7 +68,7 @@ API는 `http://localhost:8080`에서 실행됩니다.
 pip install gunicorn
 
 gunicorn portfwd_api:app \
-  --workers 4 \
+  --workers 1 \
   --worker-class uvicorn.workers.UvicornWorker \
   --bind 0.0.0.0:8080 \
   --log-level info
