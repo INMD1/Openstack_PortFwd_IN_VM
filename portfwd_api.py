@@ -403,9 +403,9 @@ app = FastAPI(
     title="OpenStack Proxy VM Port Forwarding API",
     description="Skyline 통합 포트포워딩 규칙 관리 API - SSH 전용 IP 분리 및 부하 분산 지원",
     version="1.2.0",
-    docs_url="/api/v1/docs",
-    redoc_url="/api/v1/redoc",
-    openapi_url="/api/v1/openapi.json"
+    docs_url=None,        # 자동 문서 비활성화 (보안)
+    redoc_url=None,       # ReDoc 비활성화
+    openapi_url=None      # OpenAPI 스키마 비활성화
 )
 
 # Rate Limiting 설정

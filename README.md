@@ -95,6 +95,36 @@ PORTFWD_EXCLUDED_PORTS=220,80,443,1420,8080
 MAX_RULES_PER_IP=600
 ```
 
+#### 자동 문서 활성화/비활성화
+
+**프로덕션 환경에서는 보안을 위해 자동 문서를 비활성화하는 것을 권장합니다.**
+
+`portfwd_api.py` 파일에서 FastAPI 설정 수정:
+
+**문서 비활성화 (프로덕션 권장)**
+```python
+app = FastAPI(
+    title="OpenStack Proxy VM Port Forwarding API",
+    description="Skyline 통합 포트포워딩 규칙 관리 API - SSH 전용 IP 분리 및 부하 분산 지원",
+    version="1.2.0",
+    docs_url=None,        # 자동 문서 비활성화 (보안)
+    redoc_url=None,       # ReDoc 비활성화
+    openapi_url=None      # OpenAPI 스키마 비활성화
+)
+```
+
+**문서 활성화 (개발 환경)**
+```python
+app = FastAPI(
+    title="OpenStack Proxy VM Port Forwarding API",
+    description="Skyline 통합 포트포워딩 규칙 관리 API - SSH 전용 IP 분리 및 부하 분산 지원",
+    version="1.2.0",
+    docs_url="/api/v1/docs",
+    redoc_url="/api/v1/redoc",
+    openapi_url="/api/v1/openapi.json"
+)
+```
+
 ---
 
 ## 실행
