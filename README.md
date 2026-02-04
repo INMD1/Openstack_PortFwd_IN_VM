@@ -39,10 +39,60 @@ pip install -r requirements.txt
 # .env 파일 생성
 cp .env.example .env
 
-# .env 파일 수정 (필요시)
-# - DATABASE_URL: 데이터베이스 연결 문자열
-# - PROXY_VM_IP: Proxy VM IP 주소
-# - API_PORT: API 포트 (기본값: 8080)
+# .env 파일 수정 (필수)
+```
+
+#### 주요 환경 변수
+
+**보안 설정 (필수)**
+```bash
+# API 인증 키 - 프로덕션 환경에서 반드시 설정
+API_SECRET_KEY=your-secret-key-here
+
+# 강력한 키 생성 방법:
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**Floating IP 설정**
+```bash
+# SSH 전용 IP (랜덤 포트 할당)
+SSH_FLOATING_IP=192.168.10.179
+SSH_FLOATING_IP_GET=113.198.230.17  # 외부 표시용 IP
+
+# 일반 포트포워딩 IP (부하 분산)
+PORTFWD_FLOATING_IP_1=192.168.10.3
+PORTFWD_FLOATING_IP_1_GET=113.198.230.18
+
+PORTFWD_FLOATING_IP_2=192.168.10.16
+PORTFWD_FLOATING_IP_2_GET=113.198.230.20
+```
+
+**프록시 모드 설정**
+```bash
+# local: Proxy VM 내부에서 직접 실행
+# remote: SSH로 원격 Proxy VM 제어
+PROXY_MODE=local
+
+# production: 실제 iptables 적용
+# development: 시뮬레이션만 수행
+ENV=production
+```
+
+**포트 범위 및 제한**
+```bash
+# SSH 포트 범위
+SSH_PORT_MIN=1
+SSH_PORT_MAX=1000
+
+# 일반 포트포워딩 범위
+PORTFWD_PORT_MIN=1
+PORTFWD_PORT_MAX=1000
+
+# 제외할 포트 (쉼표로 구분)
+PORTFWD_EXCLUDED_PORTS=220,80,443,1420,8080
+
+# IP당 최대 규칙 수
+MAX_RULES_PER_IP=600
 ```
 
 ---
@@ -119,17 +169,21 @@ curl http://localhost:8080/api/v1/health
 
 ### 3. 포트포워딩 규칙 생성
 
+**⚠️ 인증 필수**: 모든 요청에 `Authorization` 헤더를 포함해야 합니다.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/portforward \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
   -d '{
     "rule_name": "web-server-80",
     "user_vm_id": "550e8400-e29b-41d4-a716-446655440000",
     "user_vm_name": "web-server-01",
     "user_vm_internal_ip": "10.0.0.6",
     "user_vm_internal_port": 80,
+    "service_type": "other",
     "protocol": "tcp",
-    "description": "웹 서버 SSH 접속"
+    "description": "웹 서버 포트포워딩"
   }'
 ```
 
@@ -158,19 +212,23 @@ curl -X POST http://localhost:8080/api/v1/portforward \
 
 ```bash
 # 모든 규칙
-curl http://localhost:8080/api/v1/portforward
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/portforward
 
 # 활성 규칙만
-curl http://localhost:8080/api/v1/portforward?status=active
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/portforward?status=active
 
 # 특정 Floating IP 규칙
-curl http://localhost:8080/api/v1/portforward?floating_ip=172.24.4.11
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/portforward?floating_ip=113.198.230.18
 ```
 
 ### 5. 특정 규칙 조회
 
 ```bash
-curl http://localhost:8080/api/v1/portforward/{rule_id}
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/portforward/{rule_id}
 ```
 
 ### 6. 규칙 업데이트
@@ -178,6 +236,7 @@ curl http://localhost:8080/api/v1/portforward/{rule_id}
 ```bash
 curl -X PATCH http://localhost:8080/api/v1/portforward/{rule_id} \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
   -d '{
     "status": "inactive",
     "description": "임시 비활성화"
@@ -187,13 +246,16 @@ curl -X PATCH http://localhost:8080/api/v1/portforward/{rule_id} \
 ### 7. 규칙 삭제
 
 ```bash
-curl -X DELETE http://localhost:8080/api/v1/portforward/{rule_id}
+curl -X DELETE \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/portforward/{rule_id}
 ```
 
 ### 8. 시스템 상태 조회
 
 ```bash
-curl http://localhost:8080/api/v1/status
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/status
 ```
 
 응답:
@@ -227,40 +289,106 @@ curl http://localhost:8080/api/v1/status
 ### 9. Floating IP 상태
 
 ```bash
-curl http://localhost:8080/api/v1/floating-ips
+curl -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  http://localhost:8080/api/v1/floating-ips
 ```
 
----
+### 10. 서비스 유형에 따른 IP 할당
 
-## 인증 (Bearer Token)
-
-API 엔드포인트에 인증을 추가하려면:
+**SSH 서비스** (service_type: "ssh")
+- SSH 전용 IP (SSH_FLOATING_IP) 사용
+- 랜덤 포트 자동 할당
+- SSH 포트 범위 내에서 선택
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/portforward \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-token-here" \
-  -d '{...}'
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  -d '{
+    "rule_name": "ssh-to-vm1",
+    "user_vm_id": "uuid-here",
+    "user_vm_name": "vm-1",
+    "user_vm_internal_ip": "10.0.0.5",
+    "user_vm_internal_port": 22,
+    "service_type": "ssh",
+    "protocol": "tcp"
+  }'
 ```
 
-### 토큰 검증 커스터마이징
+**일반 포트포워딩** (service_type: "other")
+- 2개의 포트포워딩 IP 중 부하가 적은 IP 자동 선택
+- 순차적 포트 할당
 
-`portfwd_api.py`의 `verify_token()` 함수를 수정하여 실제 토큰 검증 로직 추가:
+```bash
+curl -X POST http://localhost:8080/api/v1/portforward \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_SECRET_KEY" \
+  -d '{
+    "rule_name": "web-service",
+    "user_vm_id": "uuid-here",
+    "user_vm_name": "web-vm",
+    "user_vm_internal_ip": "10.0.0.10",
+    "user_vm_internal_port": 80,
+    "service_type": "other",
+    "protocol": "tcp"
+  }'
+```
+
+---
+
+## 🔒 API 인증 (필수)
+
+### API_SECRET_KEY 설정
+
+`.env` 파일에 `API_SECRET_KEY`가 설정되어 있으면 모든 API 요청에 인증이 필요합니다.
+
+**1. 강력한 키 생성**
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**2. .env 파일에 추가**
+```bash
+API_SECRET_KEY=KgIwKUsbnTmNNlsX51F_yhKmM_yPzAvxnE4LNjw4exk
+```
+
+**3. API 호출 시 모든 요청에 Authorization 헤더 포함**
+```bash
+curl -H "Authorization: Bearer KgIwKUsbnTmNNlsX51F_yhKmM_yPzAvxnE4LNjw4exk" \
+  http://localhost:8080/api/v1/status
+```
+
+### 인증 동작 방식
+
+- ✅ **올바른 키**: API 정상 작동
+- ❌ **키 없음**: HTTP 401 Unauthorized
+- ❌ **잘못된 키**: HTTP 401 Unauthorized
+
+### Python에서 사용
 
 ```python
-async def verify_token(authorization: Optional[str] = Header(None)) -> str:
-    if authorization is None:
-        raise HTTPException(status_code=401, detail="토큰이 필요합니다")
-    
-    # JWT, OAuth2, API Key 등 검증 로직 추가
-    token = authorization.replace("Bearer ", "")
-    
-    # 실제 검증 로직
-    if not validate_token(token):
-        raise HTTPException(status_code=401, detail="유효하지 않은 토큰")
-    
-    return token
+import requests
+
+API_KEY = "KgIwKUsbnTmNNlsX51F_yhKmM_yPzAvxnE4LNjw4exk"
+BASE_URL = "http://localhost:8080/api/v1"
+
+headers = {"Authorization": f"Bearer {API_KEY}"}
+
+# 모든 요청에 headers 포함
+response = requests.get(f"{BASE_URL}/status", headers=headers)
+print(response.json())
 ```
+
+### 보안 권장사항
+
+⚠️ **중요**: 프로덕션 환경에서는 반드시 `API_SECRET_KEY`를 설정하세요!
+
+- `.env` 파일을 git에 커밋하지 마세요
+- 정기적으로 키를 교체하세요
+- 키를 로그에 출력하지 마세요
+- HTTPS를 사용하여 키 노출을 방지하세요
+
+> 📖 자세한 내용은 [`API_AUTH_GUIDE.md`](./API_AUTH_GUIDE.md) 참조
 
 ---
 

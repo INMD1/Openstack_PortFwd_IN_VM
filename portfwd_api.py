@@ -13,18 +13,33 @@ import subprocess
 import json
 import uuid
 import random
+import re
+import shlex
+import hashlib
+import secrets
 from datetime import datetime
 from typing import Optional, List, Tuple
 from enum import Enum
 from ipaddress import IPv4Address, AddressValueError
 
-from fastapi import FastAPI, HTTPException, status, Header, Depends
+from fastapi import FastAPI, HTTPException, status, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import logging
+
+# Rate Limiting (선택적 - 설치되지 않은 경우 비활성화)
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMITING_ENABLED = True
+except ImportError:
+    RATE_LIMITING_ENABLED = False
+    logger_init = logging.getLogger(__name__)
+    logger_init.warning("slowapi가 설치되지 않음 - Rate Limiting 비활성화 (pip install slowapi)")
 
 # ============================================================================
 # 로깅 설정
@@ -34,6 +49,82 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 보안 설정
+# ============================================================================
+# API 인증 키 (환경변수로 설정, 없으면 anonymous 허용)
+API_SECRET_KEY = os.getenv('API_SECRET_KEY', '')
+API_AUTH_ENABLED = bool(API_SECRET_KEY.strip())
+
+if not API_AUTH_ENABLED:
+    logger.warning("⚠️ API_SECRET_KEY가 설정되지 않음 - 인증 없이 접근 허용됨 (프로덕션에서는 설정 권장)")
+
+# Rate Limit 설정
+RATE_LIMIT_REQUESTS = os.getenv('RATE_LIMIT_REQUESTS', '60/minute')
+RATE_LIMIT_BURST = os.getenv('RATE_LIMIT_BURST', '10/second')
+
+# ============================================================================
+# 입력값 검증 함수 (명령 인젝션 방지)
+# ============================================================================
+def sanitize_ip(ip: str) -> str:
+    """
+    IP 주소 검증 및 정제
+    - IPv4 형식만 허용
+    - 특수문자, 쉘 메타문자 차단
+    """
+    if not ip:
+        raise ValueError("IP 주소가 비어있습니다")
+    
+    # 허용 문자: 숫자와 점만
+    if not re.match(r'^[0-9.]+$', ip):
+        raise ValueError(f"유효하지 않은 IP 주소 형식: {ip}")
+    
+    # IPv4 형식 검증
+    try:
+        validated = IPv4Address(ip)
+        return str(validated)
+    except AddressValueError:
+        raise ValueError(f"유효하지 않은 IPv4 주소: {ip}")
+
+
+def sanitize_port(port: int) -> int:
+    """
+    포트 번호 검증
+    - 1-65535 범위만 허용
+    - 정수형만 허용
+    """
+    if not isinstance(port, int):
+        raise ValueError(f"포트는 정수여야 합니다: {port}")
+    
+    if port < 1 or port > 65535:
+        raise ValueError(f"포트 범위 초과 (1-65535): {port}")
+    
+    return port
+
+
+def sanitize_protocol(protocol: str) -> str:
+    """프로토콜 검증 - tcp/udp만 허용"""
+    protocol = protocol.lower().strip()
+    if protocol not in ('tcp', 'udp'):
+        raise ValueError(f"유효하지 않은 프로토콜: {protocol}")
+    return protocol
+
+
+def validate_rule_name(name: str) -> str:
+    """
+    규칙 이름 검증
+    - 영문, 숫자, 한글, 하이픈, 언더스코어만 허용
+    - 최대 255자
+    """
+    if not name or len(name) > 255:
+        raise ValueError("규칙 이름은 1-255자여야 합니다")
+    
+    # 허용 패턴: 영문, 숫자, 한글, 하이픈, 언더스코어, 공백
+    if not re.match(r'^[\w\s가-힣\-]+$', name, re.UNICODE):
+        raise ValueError(f"규칙 이름에 허용되지 않은 문자 포함: {name}")
+    
+    return name.strip()
 
 # ============================================================================
 # 데이터베이스 설정
@@ -311,28 +402,75 @@ class PortAllocationResponse(BaseModel):
 app = FastAPI(
     title="OpenStack Proxy VM Port Forwarding API",
     description="Skyline 통합 포트포워딩 규칙 관리 API - SSH 전용 IP 분리 및 부하 분산 지원",
-    version="1.1.0",
+    version="1.2.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc",
     openapi_url="/api/v1/openapi.json"
 )
 
+# Rate Limiting 설정
+if RATE_LIMITING_ENABLED:
+    limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT_REQUESTS])
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    logger.info(f"Rate Limiting 활성화: {RATE_LIMIT_REQUESTS}")
+
 # ============================================================================
-# 인증 (Bearer Token)
+# 인증 (Bearer Token / API Key)
 # ============================================================================
 async def verify_token(authorization: Optional[str] = Header(None)) -> str:
-    """API 토큰 검증 (선택사항)"""
-    if authorization is None:
+    """
+    API 토큰 검증
+    
+    - API_SECRET_KEY가 설정된 경우: Bearer 토큰 필수
+    - API_SECRET_KEY가 없는 경우: anonymous 허용 (개발 환경)
+    
+    사용 예시:
+        curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:8080/api/v1/...
+    """
+    # API 인증이 비활성화된 경우 (개발 환경)
+    if not API_AUTH_ENABLED:
+        if authorization:
+            # 토큰이 제공되면 그대로 사용 (ID 용도)
+            if authorization.startswith("Bearer "):
+                return authorization.replace("Bearer ", "")
+            return authorization
         return "anonymous"
+    
+    # API 인증이 활성화된 경우 (프로덕션)
+    if authorization is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization 헤더가 필요합니다. 형식: 'Bearer YOUR_API_KEY'",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="유효하지 않은 토큰 형식입니다"
+            detail="유효하지 않은 토큰 형식입니다. 형식: 'Bearer YOUR_API_KEY'",
+            headers={"WWW-Authenticate": "Bearer"}
         )
     
-    token = authorization.replace("Bearer ", "")
-    # TODO: JWT, OAuth2, API Key 등 실제 검증 로직 추가
+    token = authorization.replace("Bearer ", "").strip()
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API 키가 비어있습니다",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    # API Key 검증 (타이밍 공격 방지를 위한 상수 시간 비교)
+    if not secrets.compare_digest(token, API_SECRET_KEY):
+        logger.warning(f"API 인증 실패: 잘못된 키 시도")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="유효하지 않은 API 키입니다",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    logger.debug("API 인증 성공")
     return token
 
 # ============================================================================
@@ -474,10 +612,14 @@ def check_iptables_rule_exists(
     external_port: int,
     internal_ip: str,
     internal_port: int,
-    protocol: str = "tcp"
+    protocol: str = "tcp",
+    chain: str = "PREROUTING"
 ) -> bool:
     """
     iptables에 해당 규칙이 이미 존재하는지 확인
+    
+    Args:
+        chain: "PREROUTING" (DNAT) 또는 "POSTROUTING" (MASQUERADE)
     
     Returns:
         True: 규칙이 이미 존재함
@@ -487,8 +629,11 @@ def check_iptables_rule_exists(
         return False  # 개발 환경에서는 항상 새로 추가
     
     try:
-        # PREROUTING 체인에서 해당 규칙 확인
-        check_cmd = f"sudo iptables -t nat -C PREROUTING -p {protocol} -d {floating_ip} --dport {external_port} -j DNAT --to-destination {internal_ip}:{internal_port}"
+        # 체인에 따라 다른 규칙 확인
+        if chain == "PREROUTING":
+            check_cmd = f"sudo iptables -t nat -C PREROUTING -p {protocol} -d {floating_ip} --dport {external_port} -j DNAT --to-destination {internal_ip}:{internal_port}"
+        else:  # POSTROUTING
+            check_cmd = f"sudo iptables -t nat -C POSTROUTING -p {protocol} -d {internal_ip} --dport {internal_port} -j MASQUERADE"
         
         if PROXY_MODE == 'local':
             result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=10)
@@ -503,7 +648,7 @@ def check_iptables_rule_exists(
         return result.returncode == 0
         
     except Exception as e:
-        logger.warning(f"iptables 규칙 확인 중 오류: {str(e)}")
+        logger.warning(f"iptables 규칙 확인 중 오류 ({chain}): {str(e)}")
         return False
 
 
@@ -523,15 +668,28 @@ def apply_iptables_rule(
     - remote: SSH로 Proxy VM에 명령 전달
     - development: 시뮬레이션만 (로그 출력)
     
-    추가 시 이미 존재하는 규칙은 스킵합니다.
+    보안:
+    - 모든 입력값 검증 (명령 인젝션 방지)
+    - 중복 규칙 자동 스킵 (DNAT + MASQUERADE 모두)
     """
     try:
+        # ========== 입력값 검증 (명령 인젝션 방지) ==========
+        try:
+            floating_ip = sanitize_ip(floating_ip)
+            internal_ip = sanitize_ip(internal_ip)
+            external_port = sanitize_port(external_port)
+            internal_port = sanitize_port(internal_port)
+            protocol = sanitize_protocol(protocol)
+        except ValueError as e:
+            logger.error(f"iptables 입력값 검증 실패: {str(e)}")
+            return False, f"입력값 검증 실패: {str(e)}"
+        
         action = "-A" if add else "-D"
         action_text = "추가" if add else "삭제"
         
-        # 추가 시 중복 체크
-        if add and check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol):
-            logger.info(f"iptables 규칙 이미 존재 (스킵): {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
+        # 추가 시 DNAT 중복 체크
+        if add and check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol, "PREROUTING"):
+            logger.info(f"iptables DNAT 규칙 이미 존재 (스킵): {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
             return True, "이미 존재하는 규칙 (스킵)"
         
         # 1. DNAT 규칙 (외부 → 내부 변환)
@@ -541,7 +699,8 @@ def apply_iptables_rule(
             f"-j DNAT --to-destination {internal_ip}:{internal_port}"
         )
         
-        # 2. MASQUERADE 규칙 (응답 패킷 처리)
+        # 2. MASQUERADE 규칙 (응답 패킷 처리) - 중복 체크 포함
+        masq_exists = check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol, "POSTROUTING") if add else False
         masq_rule = (
             f"iptables -t nat {action} POSTROUTING -p {protocol} "
             f"-d {internal_ip} --dport {internal_port} "
@@ -551,22 +710,33 @@ def apply_iptables_rule(
         if os.getenv('ENV') != 'production':
             # 개발 환경: 시뮬레이션
             logger.info(f"[SIM-{action_text}] {nat_rule}")
-            logger.info(f"[SIM-{action_text}] {masq_rule}")
+            if not masq_exists:
+                logger.info(f"[SIM-{action_text}] {masq_rule}")
+            else:
+                logger.info(f"[SIM-스킵] MASQUERADE 이미 존재")
             return True, "시뮬레이션 성공"
         
         # 프로덕션 환경
         if PROXY_MODE == 'local':
             # 로컬 모드: Proxy VM 내부에서 직접 실행
-            for rule in [nat_rule, masq_rule]:
-                # sudo 권한으로 실행
-                cmd = f"sudo {rule}"
+            # DNAT 규칙 적용
+            cmd = f"sudo {nat_rule}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                if add or "No chain/target/match" not in result.stderr:
+                    logger.error(f"iptables DNAT 규칙 {action_text} 실패: {result.stderr}")
+                    return False, result.stderr
+            
+            # MASQUERADE 규칙 적용 (중복이 아닌 경우만)
+            if not masq_exists:
+                cmd = f"sudo {masq_rule}"
                 result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                
                 if result.returncode != 0:
-                    # "-D" 삭제 시 규칙이 없으면 무시
                     if add or "No chain/target/match" not in result.stderr:
-                        logger.error(f"iptables 규칙 {action_text} 실패: {result.stderr}")
+                        logger.error(f"iptables MASQUERADE 규칙 {action_text} 실패: {result.stderr}")
                         return False, result.stderr
+            else:
+                logger.info(f"MASQUERADE 규칙 이미 존재 (스킵): {internal_ip}:{internal_port}")
             
             logger.info(f"iptables 규칙 {action_text} 성공 [로컬]: {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
         
