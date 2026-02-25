@@ -938,13 +938,20 @@ async def create_port_forwarding(
             assigned_ip = request_ip
             
             if request.proxy_external_port:
-                # 포트도 지정된 경우 충돌 검사
+                # 포트도 지정된 경우 충돌 검사 → 중복 시 자동 대체
                 if check_port_conflict(db, assigned_ip, request.proxy_external_port):
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"포트 {assigned_ip}:{request.proxy_external_port}은 이미 사용 중입니다"
+                    logger.warning(
+                        f"요청 포트 {assigned_ip}:{request.proxy_external_port}이 이미 사용 중 "
+                        f"- 사용 가능한 포트로 자동 대체"
                     )
-                assigned_port = request.proxy_external_port
+                    assigned_port = find_available_port(db, assigned_ip, request.service_type.value)
+                    if assigned_port is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="요청 포트가 사용 중이며 대체 가능한 포트도 없습니다"
+                        )
+                else:
+                    assigned_port = request.proxy_external_port
             else:
                 # 포트만 자동 할당
                 assigned_port = find_available_port(db, assigned_ip, request.service_type.value)
@@ -1157,11 +1164,54 @@ async def update_port_forwarding(
                 detail="규칙을 찾을 수 없습니다"
             )
         
+        # 외부 포트 변경 요청 처리 (중복 시 자동 대체)
+        if request.proxy_external_port is not None:
+            new_port = request.proxy_external_port
+            # 자기 자신 포트와 다른 경우에만 충돌 검사
+            if new_port != rule.proxy_external_port:
+                if check_port_conflict(db, rule.proxy_external_ip, new_port):
+                    logger.warning(
+                        f"업데이트 요청 포트 {rule.proxy_external_ip}:{new_port}이 이미 사용 중 "
+                        f"- 사용 가능한 포트로 자동 대체"
+                    )
+                    new_port = find_available_port(db, rule.proxy_external_ip, rule.service_type)
+                    if new_port is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="요청 포트가 사용 중이며 대체 가능한 포트도 없습니다"
+                        )
+
+                # 기존 iptables 규칙 삭제 후 새 포트로 재등록
+                if rule.status == StatusEnum.ACTIVE.value:
+                    apply_iptables_rule(
+                        rule.proxy_external_ip,
+                        rule.proxy_external_port,
+                        rule.user_vm_internal_ip,
+                        rule.user_vm_internal_port,
+                        rule.protocol,
+                        add=False
+                    )
+                    apply_iptables_rule(
+                        rule.proxy_external_ip,
+                        new_port,
+                        rule.user_vm_internal_ip,
+                        rule.user_vm_internal_port,
+                        rule.protocol,
+                        add=True
+                    )
+                    save_iptables_persistent()
+
+                logger.info(
+                    f"외부 포트 변경: {rule.proxy_external_ip}:{rule.proxy_external_port} "
+                    f"→ {rule.proxy_external_ip}:{new_port}"
+                )
+                rule.proxy_external_port = new_port
+
         # 상태 변경 시 iptables 규칙도 업데이트
         if request.status:
             old_status = rule.status
             new_status = request.status.value
-            
+
             if old_status == StatusEnum.ACTIVE.value and new_status == StatusEnum.INACTIVE.value:
                 # 비활성화: iptables 규칙 삭제
                 apply_iptables_rule(
@@ -1182,10 +1232,10 @@ async def update_port_forwarding(
                     rule.protocol,
                     add=True
                 )
-            
+
             save_iptables_persistent()
-        
-        # 필드 업데이트
+
+        # 나머지 필드 업데이트
         if request.rule_name:
             rule.rule_name = request.rule_name
         if request.user_vm_name:
