@@ -550,56 +550,57 @@ def select_floating_ip_for_ssh(db: Session) -> Tuple[Optional[str], Optional[int
 def select_floating_ip_for_portfwd(db: Session) -> Tuple[Optional[str], Optional[int]]:
     """
     2번/3번 IP를 비교하여 가장 여유 있는 IP와 포트 반환
-    
+
     로직:
     - 두 IP의 사용량을 비교
     - 가장 적게 사용된 IP 선택
-    - 해당 IP에서 가장 낮은 사용 가능한 포트 할당
-    
+    - 해당 IP에서 랜덤 포트 할당 (예측 불가)
+
     Returns:
         (floating_ip, available_port) 또는 (None, None)
     """
     best_ip = None
-    best_port = None
+    best_available_ports: list = []
     min_usage = float('inf')
     max_available = 0
-    
+
     port_range = FloatingIPConfig.PORTFWD_PORT_RANGE
     excluded_ports = FloatingIPConfig.PORTFWD_EXCLUDED_PORTS
-    
+
     for ip in FloatingIPConfig.PORTFWD_FLOATING_IPS:
         used_port_set = get_used_ports(db, ip)
         usage_count = len(used_port_set)
-        available_count = (port_range[1] - port_range[0] + 1) - usage_count - len(excluded_ports)
-        
+        available_ports = [
+            p for p in range(port_range[0], port_range[1] + 1)
+            if p not in used_port_set and p not in excluded_ports
+        ]
+        available_count = len(available_ports)
+
         logger.debug(f"IP {ip}: 사용중 {usage_count}, 여유 {available_count}")
-        
+
         # 가장 여유있는 IP 선택 (사용량이 가장 적은 IP)
         if available_count > max_available or (available_count == max_available and usage_count < min_usage):
-            # 사용 가능한 포트 찾기 (순차적으로)
-            for port in range(port_range[0], port_range[1] + 1):
-                if port not in used_port_set and port not in excluded_ports:
-                    best_ip = ip
-                    best_port = port
-                    min_usage = usage_count
-                    max_available = available_count
-                    break
-    
-    if best_ip and best_port:
-        logger.info(f"포트포워딩 할당: {best_ip}:{best_port} (비교 선택, 사용량: {min_usage})")
-    else:
-        logger.warning("모든 포트포워딩 IP가 가득 참")
-    
-    return best_ip, best_port
+            best_ip = ip
+            best_available_ports = available_ports
+            min_usage = usage_count
+            max_available = available_count
+
+    if best_ip and best_available_ports:
+        selected_port = secrets.choice(best_available_ports)
+        logger.info(f"포트포워딩 할당: {best_ip}:{selected_port} (랜덤 선택, 사용량: {min_usage})")
+        return best_ip, selected_port
+
+    logger.warning("모든 포트포워딩 IP가 가득 참")
+    return None, None
 
 
 def find_available_port(db: Session, floating_ip: str, service_type: str = "other") -> Optional[int]:
     """
-    특정 Floating IP에서 사용 가능한 포트 찾기
+    특정 Floating IP에서 사용 가능한 포트를 랜덤으로 반환
     (사용자가 IP를 직접 지정한 경우)
     """
     used_port_set = get_used_ports(db, floating_ip)
-    
+
     # 서비스 유형에 따른 포트 범위 및 제외 포트 결정
     if service_type == ServiceTypeEnum.SSH.value:
         port_range = FloatingIPConfig.SSH_PORT_RANGE
@@ -607,12 +608,16 @@ def find_available_port(db: Session, floating_ip: str, service_type: str = "othe
     else:
         port_range = FloatingIPConfig.PORTFWD_PORT_RANGE
         excluded_ports = FloatingIPConfig.PORTFWD_EXCLUDED_PORTS
-    
-    for port in range(port_range[0], port_range[1] + 1):
-        if port not in used_port_set and port not in excluded_ports:
-            return port
-    
-    return None
+
+    available_ports = [
+        p for p in range(port_range[0], port_range[1] + 1)
+        if p not in used_port_set and p not in excluded_ports
+    ]
+
+    if not available_ports:
+        return None
+
+    return secrets.choice(available_ports)
 
 
 def check_port_conflict(db: Session, floating_ip: str, external_port: int) -> bool:
