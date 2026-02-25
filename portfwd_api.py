@@ -12,7 +12,6 @@ load_dotenv()
 import subprocess
 import json
 import uuid
-import random
 import re
 import shlex
 import hashlib
@@ -235,6 +234,41 @@ PROXY_VM_IP = os.getenv('PROXY_VM_IP', '172.24.4.10')
 PROXY_VM_SSH_PORT = int(os.getenv('PROXY_VM_SSH_PORT', 22))
 PROXY_VM_SSH_USER = os.getenv('PROXY_VM_SSH_USER', 'root')
 PROXY_VM_SSH_KEY_PATH = os.getenv('PROXY_VM_SSH_KEY_PATH', '')
+
+def _validate_ssh_config() -> None:
+    """SSH 연결 환경변수 검증 (명령 인젝션 방지)"""
+    if PROXY_VM_IP:
+        try:
+            IPv4Address(PROXY_VM_IP)
+        except AddressValueError:
+            # 호스트명: 영문자, 숫자, 하이픈, 점만 허용
+            if not re.match(r'^[a-zA-Z0-9.\-]+$', PROXY_VM_IP):
+                raise ValueError(f"유효하지 않은 PROXY_VM_IP: {PROXY_VM_IP!r}")
+
+    if PROXY_VM_SSH_USER:
+        if not re.match(r'^[a-zA-Z0-9_\-\.]+$', PROXY_VM_SSH_USER):
+            raise ValueError(f"유효하지 않은 PROXY_VM_SSH_USER: {PROXY_VM_SSH_USER!r}")
+
+    if PROXY_VM_SSH_KEY_PATH:
+        # 쉘 메타문자 및 경로 조작 방지
+        if not re.match(r'^[a-zA-Z0-9_\-\./~]+$', PROXY_VM_SSH_KEY_PATH):
+            raise ValueError(f"유효하지 않은 PROXY_VM_SSH_KEY_PATH: {PROXY_VM_SSH_KEY_PATH!r}")
+
+_validate_ssh_config()
+
+
+def _build_ssh_base_args() -> list:
+    """SSH 기본 명령 인수 목록 반환 (shell=False 전용)"""
+    args = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "BatchMode=yes",
+        "-p", str(PROXY_VM_SSH_PORT),
+    ]
+    if PROXY_VM_SSH_KEY_PATH:
+        args.extend(["-i", PROXY_VM_SSH_KEY_PATH])
+    args.append(f"{PROXY_VM_SSH_USER}@{PROXY_VM_IP}")
+    return args
 
 # ============================================================================
 # 데이터베이스 모델
@@ -506,8 +540,8 @@ def select_floating_ip_for_ssh(db: Session) -> Tuple[Optional[str], Optional[int
         logger.warning(f"SSH IP {ssh_ip}에 사용 가능한 포트 없음 (제외: {len(excluded_ports)}개)")
         return None, None
     
-    # 랜덤 포트 선택
-    selected_port = random.choice(available_ports)
+    # 랜덤 포트 선택 (암호학적으로 안전한 랜덤 사용)
+    selected_port = secrets.choice(available_ports)
     logger.info(f"SSH 포트 할당: {ssh_ip}:{selected_port} (랜덤, 제외 포트 {len(excluded_ports)}개)")
     
     return ssh_ip, selected_port
@@ -629,21 +663,27 @@ def check_iptables_rule_exists(
         return False  # 개발 환경에서는 항상 새로 추가
     
     try:
-        # 체인에 따라 다른 규칙 확인
+        # 체인에 따라 다른 규칙 확인 (인수 목록으로 구성 - 명령 인젝션 방지)
         if chain == "PREROUTING":
-            check_cmd = f"sudo iptables -t nat -C PREROUTING -p {protocol} -d {floating_ip} --dport {external_port} -j DNAT --to-destination {internal_ip}:{internal_port}"
+            check_args = [
+                "sudo", "iptables", "-t", "nat", "-C", "PREROUTING",
+                "-p", protocol, "-d", floating_ip, "--dport", str(external_port),
+                "-j", "DNAT", "--to-destination", f"{internal_ip}:{internal_port}"
+            ]
         else:  # POSTROUTING
-            check_cmd = f"sudo iptables -t nat -C POSTROUTING -p {protocol} -d {internal_ip} --dport {internal_port} -j MASQUERADE"
-        
+            check_args = [
+                "sudo", "iptables", "-t", "nat", "-C", "POSTROUTING",
+                "-p", protocol, "-d", internal_ip, "--dport", str(internal_port),
+                "-j", "MASQUERADE"
+            ]
+
         if PROXY_MODE == 'local':
-            result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(check_args, capture_output=True, text=True, timeout=10)
         else:
-            ssh_base = f"ssh -o StrictHostKeyChecking=no -p {PROXY_VM_SSH_PORT}"
-            if PROXY_VM_SSH_KEY_PATH:
-                ssh_base += f" -i {PROXY_VM_SSH_KEY_PATH}"
-            ssh_base += f" {PROXY_VM_SSH_USER}@{PROXY_VM_IP}"
-            result = subprocess.run(f"{ssh_base} '{check_cmd}'", shell=True, capture_output=True, text=True, timeout=10)
-        
+            ssh_args = _build_ssh_base_args()
+            ssh_args.append(shlex.join(check_args))
+            result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=10)
+
         # returncode 0 = 규칙 존재, 1 = 규칙 없음
         return result.returncode == 0
         
@@ -686,78 +726,72 @@ def apply_iptables_rule(
         
         action = "-A" if add else "-D"
         action_text = "추가" if add else "삭제"
-        
+
         # 추가 시 DNAT 중복 체크
         if add and check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol, "PREROUTING"):
             logger.info(f"iptables DNAT 규칙 이미 존재 (스킵): {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
             return True, "이미 존재하는 규칙 (스킵)"
-        
-        # 1. DNAT 규칙 (외부 → 내부 변환)
-        nat_rule = (
-            f"iptables -t nat {action} PREROUTING -p {protocol} "
-            f"-d {floating_ip} --dport {external_port} "
-            f"-j DNAT --to-destination {internal_ip}:{internal_port}"
-        )
-        
-        # 2. MASQUERADE 규칙 (응답 패킷 처리) - 중복 체크 포함
+
+        # 1. DNAT 규칙 인수 목록 (외부 → 내부 변환)
+        nat_args = [
+            "sudo", "iptables", "-t", "nat", action, "PREROUTING",
+            "-p", protocol, "-d", floating_ip, "--dport", str(external_port),
+            "-j", "DNAT", "--to-destination", f"{internal_ip}:{internal_port}"
+        ]
+
+        # 2. MASQUERADE 규칙 인수 목록 (응답 패킷 처리) - 중복 체크 포함
         masq_exists = check_iptables_rule_exists(floating_ip, external_port, internal_ip, internal_port, protocol, "POSTROUTING") if add else False
-        masq_rule = (
-            f"iptables -t nat {action} POSTROUTING -p {protocol} "
-            f"-d {internal_ip} --dport {internal_port} "
-            f"-j MASQUERADE"
-        )
-        
+        masq_args = [
+            "sudo", "iptables", "-t", "nat", action, "POSTROUTING",
+            "-p", protocol, "-d", internal_ip, "--dport", str(internal_port),
+            "-j", "MASQUERADE"
+        ]
+
         if os.getenv('ENV') != 'production':
             # 개발 환경: 시뮬레이션
-            logger.info(f"[SIM-{action_text}] {nat_rule}")
+            logger.info(f"[SIM-{action_text}] {shlex.join(nat_args)}")
             if not masq_exists:
-                logger.info(f"[SIM-{action_text}] {masq_rule}")
+                logger.info(f"[SIM-{action_text}] {shlex.join(masq_args)}")
             else:
-                logger.info(f"[SIM-스킵] MASQUERADE 이미 존재")
+                logger.info("[SIM-스킵] MASQUERADE 이미 존재")
             return True, "시뮬레이션 성공"
-        
+
         # 프로덕션 환경
         if PROXY_MODE == 'local':
-            # 로컬 모드: Proxy VM 내부에서 직접 실행
-            # DNAT 규칙 적용
-            cmd = f"sudo {nat_rule}"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            # 로컬 모드: Proxy VM 내부에서 직접 실행 (shell=False)
+            result = subprocess.run(nat_args, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
                 if add or "No chain/target/match" not in result.stderr:
                     logger.error(f"iptables DNAT 규칙 {action_text} 실패: {result.stderr}")
                     return False, result.stderr
-            
+
             # MASQUERADE 규칙 적용 (중복이 아닌 경우만)
             if not masq_exists:
-                cmd = f"sudo {masq_rule}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(masq_args, capture_output=True, text=True, timeout=30)
                 if result.returncode != 0:
                     if add or "No chain/target/match" not in result.stderr:
                         logger.error(f"iptables MASQUERADE 규칙 {action_text} 실패: {result.stderr}")
                         return False, result.stderr
             else:
                 logger.info(f"MASQUERADE 규칙 이미 존재 (스킵): {internal_ip}:{internal_port}")
-            
+
             logger.info(f"iptables 규칙 {action_text} 성공 [로컬]: {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
-        
+
         else:
-            # 원격 모드: SSH로 Proxy VM에 명령 전달
-            ssh_base = f"ssh -o StrictHostKeyChecking=no -p {PROXY_VM_SSH_PORT}"
-            if PROXY_VM_SSH_KEY_PATH:
-                ssh_base += f" -i {PROXY_VM_SSH_KEY_PATH}"
-            ssh_base += f" {PROXY_VM_SSH_USER}@{PROXY_VM_IP}"
-            
-            for rule in [nat_rule, masq_rule]:
-                ssh_cmd = f"{ssh_base} 'sudo {rule}'"
-                result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True, timeout=30)
-                
+            # 원격 모드: SSH로 Proxy VM에 명령 전달 (shell=False)
+            ssh_base = _build_ssh_base_args()
+
+            for cmd_args in [nat_args, masq_args]:
+                ssh_args = ssh_base + [shlex.join(cmd_args)]
+                result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=30)
+
                 if result.returncode != 0:
                     if add or "No chain/target/match" not in result.stderr:
                         logger.error(f"iptables 규칙 {action_text} 실패: {result.stderr}")
                         return False, result.stderr
-            
+
             logger.info(f"iptables 규칙 {action_text} 성공 [원격]: {floating_ip}:{external_port} → {internal_ip}:{internal_port}")
-        
+
         return True, "성공"
         
     except subprocess.TimeoutExpired:
@@ -775,19 +809,17 @@ def save_iptables_persistent() -> bool:
         return True
     
     try:
-        # sudo sh -c 형태로 리다이렉션도 root 권한으로 실행
-        save_cmd = "sh -c 'iptables-save > /etc/iptables/rules.v4'"
-        
+        # 리다이렉션이 필요하므로 sh -c 사용 (단, 인수는 고정값이므로 안전)
+        save_args = ["sudo", "sh", "-c", "iptables-save > /etc/iptables/rules.v4"]
+
         if PROXY_MODE == 'local':
-            # 로컬 모드: 직접 실행
-            result = subprocess.run(f"sudo {save_cmd}", shell=True, capture_output=True, text=True, timeout=30)
+            # 로컬 모드: 직접 실행 (shell=False)
+            result = subprocess.run(save_args, capture_output=True, text=True, timeout=30)
         else:
-            # 원격 모드: SSH로 실행
-            ssh_base = f"ssh -o StrictHostKeyChecking=no -p {PROXY_VM_SSH_PORT}"
-            if PROXY_VM_SSH_KEY_PATH:
-                ssh_base += f" -i {PROXY_VM_SSH_KEY_PATH}"
-            ssh_base += f" {PROXY_VM_SSH_USER}@{PROXY_VM_IP}"
-            result = subprocess.run(f"{ssh_base} 'sudo {save_cmd}'", shell=True, capture_output=True, text=True, timeout=30)
+            # 원격 모드: SSH로 실행 (shell=False)
+            ssh_args = _build_ssh_base_args()
+            ssh_args.append(shlex.join(save_args))
+            result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
             logger.error(f"iptables 저장 실패: {result.stderr}")
@@ -860,17 +892,12 @@ async def shutdown_event():
 # ============================================================================
 
 @app.get("/api/v1/health", tags=["Health"])
-async def health_check():
-    """헬스 체크"""
+async def health_check(token: str = Depends(verify_token)):
+    """헬스 체크 (인증 필요)"""
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "version": "1.1.0",
-        "config": {
-            "ssh_ip": FloatingIPConfig.get_external_ip(FloatingIPConfig.SSH_FLOATING_IP),
-            "portfwd_ips": [FloatingIPConfig.get_external_ip(ip) for ip in FloatingIPConfig.PORTFWD_FLOATING_IPS],
-            "env": os.getenv('ENV', 'development')
-        }
     }
 
 
@@ -967,7 +994,7 @@ async def create_port_forwarding(
             service_type=request.service_type.value,
             status=StatusEnum.ACTIVE.value if success else StatusEnum.PENDING.value,
             is_persistent=True,
-            created_by=token,
+            created_by=hashlib.sha256(token.encode()).hexdigest()[:16] if token != "anonymous" else "anonymous",
             description=request.description
         )
         
@@ -993,7 +1020,7 @@ async def create_port_forwarding(
         logger.error(f"포트포워딩 생성 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1037,7 +1064,7 @@ async def list_port_forwardings(
         logger.error(f"규칙 목록 조회 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1065,7 +1092,7 @@ async def get_port_forwardings_by_vm(
         logger.error(f"VM 규칙 조회 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1101,7 +1128,7 @@ async def get_port_forwarding(
         logger.error(f"규칙 조회 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1187,7 +1214,7 @@ async def update_port_forwarding(
         logger.error(f"규칙 업데이트 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1240,7 +1267,7 @@ async def delete_port_forwarding(
         logger.error(f"규칙 삭제 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1334,7 +1361,7 @@ async def get_status(
         logger.error(f"상태 조회 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1391,7 +1418,7 @@ async def get_floating_ip_status(
         logger.error(f"Floating IP 상태 조회 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 
@@ -1434,7 +1461,7 @@ async def preview_port_allocation(
         logger.error(f"포트 할당 미리보기 중 오류: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="내부 서버 오류가 발생했습니다"
         )
 
 

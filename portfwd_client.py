@@ -414,10 +414,6 @@ def main():
             print(f"\n✅ API 상태: {health['status']}")
             print(f"   버전: {health['version']}")
             print(f"   시간: {health['timestamp']}")
-            if 'config' in health:
-                print(f"   SSH IP: {health['config']['ssh_ip']}")
-                print(f"   포트포워딩 IPs: {health['config']['portfwd_ips']}")
-                print(f"   환경: {health['config']['env']}")
     
     except Exception as e:
         print(f"\n❌ 오류: {str(e)}")
