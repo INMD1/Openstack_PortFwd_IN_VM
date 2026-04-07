@@ -14,15 +14,18 @@ import uuid
 import random
 import re
 import secrets
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Tuple
 from enum import Enum
 from ipaddress import IPv4Address, AddressValueError
-from netplan_manager import add_vm_route, remove_vm_route, sync_routes_from_vm_ips
+from netplan_manager import add_vm_route, remove_vm_route, sync_routes_from_vm_ips, sync_routes_from_db
 
 from fastapi import FastAPI, HTTPException, status, Header, Depends, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
@@ -63,6 +66,85 @@ RATE_LIMIT_REQUESTS = os.getenv('RATE_LIMIT_REQUESTS', '60/minute')
 RATE_LIMIT_BURST = os.getenv('RATE_LIMIT_BURST', '10/second')
 
 # ============================================================================
+# 스캐너/봇 차단 미들웨어
+# ============================================================================
+# 즉시 밴할 경로 패턴 (/api/v1/ 제외)
+_BLOCKED_PATH_RE = re.compile(
+    r'^('
+    r'/\.env[^/]*'          # /.env, /.env.local, /.env.prod 등
+    r'|/\.git/'             # /.git/ 하위 전체
+    r'|/\.aws/'             # /.aws/ 하위 전체
+    r'|.*\.php$'            # .php 로 끝나는 모든 경로
+    r'|/wp-[^/]+'           # /wp-* (WordPress)
+    r'|/backup[^/]*'        # /backup*
+    r'|/config\.json'       # /config.json
+    r'|/docker-compose[^/]*' # /docker-compose*
+    r')'
+)
+
+_BAN_404_WINDOW = 60    # seconds
+_BAN_404_THRESHOLD = 10 # 60초 내 404 횟수 임계값
+
+_banned_ips: set = set()
+_violation_times: dict = defaultdict(deque)  # ip → deque of timestamps
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get('X-Forwarded-For')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return request.client.host if request.client else '0.0.0.0'
+
+
+def _ban_ip(ip: str, reason: str) -> None:
+    _banned_ips.add(ip)
+    logger.warning(f"[BAN] {ip} - {reason}")
+    if os.getenv('ENV') == 'production':
+        subprocess.run(
+            f"sudo iptables -I INPUT -s {ip} -j DROP",
+            shell=True, capture_output=True
+        )
+
+
+def _unban_ip(ip: str) -> None:
+    _banned_ips.discard(ip)
+    if os.getenv('ENV') == 'production':
+        subprocess.run(
+            f"sudo iptables -D INPUT -s {ip} -j DROP",
+            shell=True, capture_output=True
+        )
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        ip = _get_client_ip(request)
+        path = request.url.path
+
+        # 1. 밴된 IP → 즉시 차단
+        if ip in _banned_ips:
+            return JSONResponse(status_code=403, content={"detail": "접근이 거부되었습니다"})
+
+        # 2. 차단 경로 패턴 (정상 API 경로 /api/v1/ 제외)
+        if not path.startswith('/api/v1/') and _BLOCKED_PATH_RE.match(path):
+            _ban_ip(ip, f"차단 경로 접근: {path}")
+            return JSONResponse(status_code=403, content={"detail": "접근이 거부되었습니다"})
+
+        # 3. 정상 요청 통과
+        response = await call_next(request)
+
+        # 4. 404 위반 횟수 기록 → 임계값 초과 시 밴
+        if response.status_code == 404:
+            now = time.time()
+            times = _violation_times[ip]
+            times.append(now)
+            while times and times[0] < now - _BAN_404_WINDOW:
+                times.popleft()
+            if len(times) > _BAN_404_THRESHOLD:
+                _ban_ip(ip, f"60초 내 404 {len(times)}회 초과")
+
+        return response
+
+# ============================================================================
 # 입력값 검증 함수 (명령 인젝션 방지)
 # ============================================================================
 def sanitize_ip(ip: str) -> str:
@@ -79,8 +161,8 @@ def sanitize_ip(ip: str) -> str:
 def sanitize_port(port: int) -> int:
     if not isinstance(port, int):
         raise ValueError(f"포트는 정수여야 합니다: {port}")
-    if port < 1 or port > 65535:
-        raise ValueError(f"포트 범위 초과 (1-65535): {port}")
+    if port < 1 or port > 999:
+        raise ValueError(f"포트 범위 초과 (1-999): {port}")
     return port
 
 def sanitize_protocol(protocol: str) -> str:
@@ -155,12 +237,12 @@ class FloatingIPConfig:
     ALL_FLOATING_IPS = [SSH_FLOATING_IP] + PORTFWD_FLOATING_IPS
     
     SSH_PORT_RANGE = (
-        int(os.getenv('SSH_PORT_MIN', 10000)),
-        int(os.getenv('SSH_PORT_MAX', 30000))
+        int(os.getenv('SSH_PORT_MIN', 100)),
+        int(os.getenv('SSH_PORT_MAX', 999))
     )
     PORTFWD_PORT_RANGE = (
-        int(os.getenv('PORTFWD_PORT_MIN', 10000)),
-        int(os.getenv('PORTFWD_PORT_MAX', 20000))
+        int(os.getenv('PORTFWD_PORT_MIN', 100)),
+        int(os.getenv('PORTFWD_PORT_MAX', 999))
     )
     
     @staticmethod
@@ -233,10 +315,10 @@ class PortForwardingCreate(BaseModel):
     user_vm_id: str
     user_vm_name: str = Field(..., min_length=1, max_length=255)
     user_vm_internal_ip: str
-    user_vm_internal_port: int = Field(..., ge=1, le=65535)
+    user_vm_internal_port: int = Field(..., ge=1, le=999)
     service_type: ServiceTypeEnum = Field(default=ServiceTypeEnum.OTHER)
     proxy_external_ip: Optional[str] = Field(None)
-    proxy_external_port: Optional[int] = Field(None, ge=1, le=65535)
+    proxy_external_port: Optional[int] = Field(None, ge=1, le=999)
     protocol: ProtocolEnum = Field(default=ProtocolEnum.TCP)
     description: Optional[str] = Field(None, max_length=500)
 
@@ -261,8 +343,8 @@ class PortForwardingCreate(BaseModel):
 class PortForwardingUpdate(BaseModel):
     rule_name: Optional[str] = None
     user_vm_name: Optional[str] = None
-    user_vm_internal_port: Optional[int] = Field(None, ge=1, le=65535)
-    proxy_external_port: Optional[int] = Field(None, ge=1, le=65535)
+    user_vm_internal_port: Optional[int] = Field(None, ge=1, le=999)
+    proxy_external_port: Optional[int] = Field(None, ge=1, le=999)
     protocol: Optional[ProtocolEnum] = None
     status: Optional[StatusEnum] = None
     description: Optional[str] = None
@@ -339,6 +421,8 @@ app = FastAPI(
     redoc_url="/api/v1/redoc",
     openapi_url="/api/v1/openapi.json"
 )
+
+app.add_middleware(SecurityMiddleware)
 
 if RATE_LIMITING_ENABLED:
     limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT_REQUESTS])
@@ -699,13 +783,12 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         sync_iptables_from_db(db)
-        active_ips = {
-            row[0] for row in
-            db.query(PortForwardingRule.user_vm_internal_ip)
-              .filter(PortForwardingRule.status == StatusEnum.ACTIVE.value)
-              .all()
-        }
-        added, removed = sync_routes_from_vm_ips(active_ips)
+        active_rules = [
+            (row.user_vm_internal_ip, row.proxy_external_ip)
+            for row in db.query(PortForwardingRule)
+                .filter(PortForwardingRule.status == StatusEnum.ACTIVE.value).all()
+        ]
+        added, removed = sync_routes_from_db(active_rules)
         logger.info(f"netplan 동기화 완료: +{added} / -{removed}")
     finally:
         db.close()
@@ -755,7 +838,8 @@ async def create_port_forwarding(request: PortForwardingCreate, db: Session = De
     db.refresh(db_rule)
     save_iptables_persistent()
 
-    add_vm_route(request.user_vm_internal_ip)
+    iface = get_interface_by_ip(assigned_ip)
+    add_vm_route(request.user_vm_internal_ip, primary_iface=iface)
     return db_rule
 
 @app.get("/api/v1/portforward", response_model=List[PortForwardingResponse], tags=["Port Forwarding"])
@@ -881,6 +965,18 @@ async def preview_port_allocation(service_type: ServiceTypeEnum = ServiceTypeEnu
     ip, port = select_floating_ip_for_ssh(db) if service_type == ServiceTypeEnum.SSH else select_floating_ip_for_portfwd(db)
     if not ip or not port: raise HTTPException(status_code=503, detail="사용 가능한 IP/포트 없음")
     return PortAllocationResponse(floating_ip=ip, external_port=port, role="ssh" if service_type == ServiceTypeEnum.SSH else "portfwd")
+
+@app.get("/api/v1/security/banned-ips", tags=["Security"])
+async def list_banned_ips(token: str = Depends(verify_token)):
+    return {"banned_ips": sorted(_banned_ips), "count": len(_banned_ips)}
+
+@app.delete("/api/v1/security/banned-ips/{ip}", status_code=status.HTTP_204_NO_CONTENT, tags=["Security"])
+async def unban_ip_endpoint(ip: str, token: str = Depends(verify_token)):
+    if ip not in _banned_ips:
+        raise HTTPException(status_code=404, detail="밴된 IP 없음")
+    _unban_ip(ip)
+    _violation_times.pop(ip, None)
+    return None
 
 if __name__ == "__main__":
     import uvicorn
